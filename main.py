@@ -4,7 +4,6 @@ import pickle
 import multiphenicsx.fem
 import multiphenicsx.fem.petsc 
 import dolfinx  as dfx
-import matplotlib.pyplot as plt
 from ufl      import inner, grad
 from sys      import argv, stdout
 from mpi4py   import MPI
@@ -45,6 +44,10 @@ params = read_input_file(argv[1])
 mesh_file = params["mesh_file"]
 ECS_TAG   = params["ECS_TAG"]
 dt        = params["dt"]
+cuda = params["cuda"]
+
+if cuda:
+    import cudolfinx as cufem
 
 # get expression of initial mmebrane potential
 v_init = Read_input_field(params['v_init'])
@@ -61,6 +64,8 @@ with open(params["tags_dictionary_file"], "rb") as f:
 # set tags info
 TAGS   = sorted(membrane_tags.keys())
 N_TAGS = len(TAGS)
+
+if comm.rank == 0: print("Num tags", TAGS)
 
 # Read mesh
 with dfx.io.XDMFFile(MPI.COMM_WORLD, mesh_file, 'r') as xdmf:
@@ -145,7 +150,8 @@ v.x.array[:] = vij_dict[(TAGS[0],TAGS[1])].x.array[:]
 
 ##### Restrictions #####
 restriction = []
-
+restriction_dof_list = []
+tot_dofs = 0
 for i in TAGS:
 
     V_i = V_dict[i]
@@ -155,12 +161,13 @@ for i in TAGS:
 
     # Get dofs of the intra- and extracellular subdomains
     dofs_Vi_Omega_i = dfx.fem.locate_dofs_topological(V_i, subdomains.dim, cells_Omega_i)
-    
+    tot_dofs += len(dofs_Vi_Omega_i)
+    if comm.rank == 0: print(f"Total dofs on tag {i}", len(dofs_Vi_Omega_i))
     # Define the restrictions of the subdomains
     restriction_Vi_Omega_i = multiphenicsx.fem.DofMapRestriction(V_i.dofmap, dofs_Vi_Omega_i)
-
+    restriction_dof_list.append(dofs_Vi_Omega_i)
     restriction.append(restriction_Vi_Omega_i)
-
+if comm.rank == 0: print("Sum of dofs across tags", tot_dofs, " total ", V.dofmap.index_map.size_global)
 # timers
 if comm.rank == 0: print(f"Creating FEM spaces:    {time.perf_counter() - t1:.2f} seconds")
 t1 = time.perf_counter()
@@ -267,6 +274,9 @@ else: # direct solver
 #      CONFIGURE SOLVER           #
 #---------------------------------#
 
+if cuda:
+    A.setType('aijcusparse')
+
 # Configure solver
 ksp = PETSc.KSP().create(comm)
 ksp.setOperators(A)
@@ -352,8 +362,8 @@ for time_step in range(params["time_steps"]):
         for j in TAGS:                        
             
             if i != j:
-            
-                membrane_ij = tuple(common_elements(membrane_i,membrane_tags[j]))   
+                if time_step == 0: 
+                    membrane_ij = tuple(common_elements(membrane_i,membrane_tags[j]))   
                 
                 if i < j:
                     ij_tuple = (i,j)                                        
@@ -373,35 +383,45 @@ for time_step in range(params["time_steps"]):
 
                     fg_local[:] = v_local[:] - tau * I_ion[ij_tuple]
 
-                L_i += L_coeff * inner(fg_dict[ij_tuple], v_i('+')) * dS(membrane_ij)
-                                
-        L_list.append(L_i)
+                if time_step == 0:
+                    L_i += L_coeff * inner(fg_dict[ij_tuple], v_i('+')) * dS(membrane_ij)
+        if time_step == 0:                            
+            L_list.append(L_i)
 
     t_test = time.perf_counter()
     
     # create some data structures
     if time_step == 0: 
+        if cuda:
+            asm = cufem.CUDAAssembler()
+            L = cufem.form(L_list, restriction=restriction_dof_list)
+            cuda_b = asm.create_vector_block(L)
+            b = cuda_b.vector
+            sol_vec = b.copy()
+        else:
+            # Convert form to dolfinx form                    
+            L = dfx.fem.form(L_list, jit_options=jit_parameters) 
 
-        # Convert form to dolfinx form                    
-        L = dfx.fem.form(L_list, jit_options=jit_parameters) 
+            # Create right-hand side and solution vectors        
+            b       = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)
+            sol_vec = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)
+        if comm.rank == 0: print("size of b", b.getSize())
 
-        # Create right-hand side and solution vectors        
-        b       = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)
-        sol_vec = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)                
-
-    
-    # Clear RHS vector to avoid accumulation and assemble RHS
-    b.array[:] = 0
-    b.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-    multiphenicsx.fem.petsc.assemble_vector_block(b, L, a, restriction=restriction) # Assemble RHS vector        
+    if cuda:
+        asm.assemble_vector_block(L, cuda_b)
+    else:
+        # Clear RHS vector to avoid accumulation and assemble RHS
+        b.array[:] = 0
+        b.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+        multiphenicsx.fem.petsc.assemble_vector_block(b, L, a, restriction=restriction) # Assemble RHS vector        
         
     # dump(b, 'output/bvec')
         
     # Neumann BC
-    if time_step == 0:
+    #if time_step == 0:
         
         # Create solution vector
-        sol_vec = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)        
+    #    sol_vec = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)        
 
     # if the timestep is not zero, b changes anyway and the nullspace must be removed
     nullspace.remove(b)
@@ -411,39 +431,44 @@ for time_step in range(params["time_steps"]):
     # Solve the system
     t1 = time.perf_counter() # Timestamp for solver time-lapse
     ksp.solve(b, sol_vec)
-
     # store iterisons 
     ksp_iterations.append(ksp.getIterationNumber())
 
-    # Update ghost values
-    sol_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+    if not cuda:
+        # Update ghost values
+        sol_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
     
     # Extract sub-components of solution
-    dofmap_list = (N_TAGS) * [V.dofmap]
-    with multiphenicsx.fem.petsc.BlockVecSubVectorWrapper(sol_vec, dofmap_list, restriction) as uij_wrapper:
-        for ui_ue_wrapper_local, component in zip(uij_wrapper, tuple(uh_dict.values())): 
-            with component.x.petsc_vec.localForm() as component_local:
-                component_local[:] = ui_ue_wrapper_local
+    if cuda:
+        offset = 0
+        for i, restriction_dofs in zip(TAGS, restriction_dof_list):
+            uh_dict[i].x.array[restriction_dofs] = sol_vec.array[offset:offset+len(restriction_dofs)]
+            offset += len(restriction_dofs)
+
+    else:
+        dofmap_list = (N_TAGS) * [V.dofmap]
+        with multiphenicsx.fem.petsc.BlockVecSubVectorWrapper(sol_vec, dofmap_list, restriction) as uij_wrapper:
+            for ui_ue_wrapper_local, component in zip(uij_wrapper, tuple(uh_dict.values())): 
+                with component.x.petsc_vec.localForm() as component_local:
+                    component_local[:] = ui_ue_wrapper_local
 
     for i in TAGS:
         for j in TAGS:
             if i < j:                
                 vij_dict[(i,j)].x.array[:] = uh_dict[i].x.array - uh_dict[j].x.array
     
-    # fill v for visualization
-    v.x.array[:] = uh_dict[ECS_TAG].x.array
-
-    for i in TAGS:
-        if i != ECS_TAG:
-            v.x.array[:] -= uh_dict[i].x.array
-
-
     solve_time += time.perf_counter() - t1 # Add time lapsed to total solver time
 
     # save xdmf output
     if params["save_output"] and time_step % params["save_interval"] == 0:               
         for i in TAGS:
             out_sol.write_function(uh_dict[i], t)        
+        # fill v for visualization
+        v.x.array[:] = uh_dict[ECS_TAG].x.array
+
+        for i in TAGS:
+            if i != ECS_TAG:
+                v.x.array[:] -= uh_dict[i].x.array
 
         out_v.write_function(v, t)
 
