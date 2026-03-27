@@ -48,6 +48,7 @@ params = read_input_file(argv[1])
 # aliases
 mesh_file = params["mesh_file"]
 ECS_TAG   = params["ECS_TAG"]
+params["ECS_TAG"] = int(ECS_TAG)
 dt        = params["dt"]
 cuda = params["cuda"]
 
@@ -328,7 +329,7 @@ else:
   # Assemble the block linear system matrix
   A = multiphenicsx.fem.petsc.assemble_matrix_block(a, bcs=bcs, restriction=(restriction, restriction))
   A.assemble()
-print(f"A norm {A.norm()}")
+#print(f"A norm {A.norm()}")
 assemble_time += time.perf_counter() - t1 # Add time lapsed to total assembly time
 matrix_assemble_time = assemble_time
 
@@ -527,6 +528,7 @@ for time_step in range(params["time_steps"]):
             cuda_b = asm.create_vector_block(L)
             b = cuda_b.vector
             sol_vec = b.copy()
+            packed_bcs = L.make_block_bc(bcs)[0]
         else:
             # Convert form to dolfinx form                    
             L = dfx.fem.form(L_list, jit_options=jit_parameters) 
@@ -538,7 +540,7 @@ for time_step in range(params["time_steps"]):
     if cuda:
         asm.assemble_vector_block(L, cuda_b)
         # apply lifting
-        asm.apply_lifting_block(cuda_b, cuda_a, bcs, set_bcs=True)
+        asm.apply_lifting_block(cuda_b, cuda_a, bcs=packed_bcs, set_bcs=True)
     else:
         # Clear RHS vector to avoid accumulation and assemble RHS
         b.array[:] = 0
@@ -548,7 +550,7 @@ for time_step in range(params["time_steps"]):
     if not Dirichletbc:
         # if the timestep is not zero, b changes anyway and the nullspace must be removed
         nullspace.remove(b)
-    print(f"b norm {b.norm()}")
+    #print(f"b norm {b.norm()}")
     assemble_time += time.perf_counter() - t1 # Add time lapsed to total assembly time
 
     
@@ -564,7 +566,7 @@ for time_step in range(params["time_steps"]):
     if not cuda:
         # Update ghost values
         sol_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-    print(f"sol_vec norm {sol_vec.norm()}")
+    #print(f"sol_vec norm {sol_vec.norm()}")
     # Extract sub-components of solution
     if cuda:
         offset = 0

@@ -32,11 +32,15 @@ class Read_input_field:
 
 # Create input field based on type and value
 def read_input_field(expr: Union[str, float, int], V: FunctionSpace = None, mesh=None):
-    
+    if V is None: return float(expr)
+    try:
+        interp_points = V.element.interpolation_points()
+    except:
+        interp_points = V.element.interpolation_points
     if isinstance(expr, (float, int)):
         if V is None:
             return float(expr)
-        return Expression(ufl.as_ufl(expr), V.element.interpolation_points, MPI.COMM_WORLD)
+        return Expression(ufl.as_ufl(expr), interp_points, MPI.COMM_WORLD)
 
     elif isinstance(expr, str):
         # resolve mesh
@@ -45,7 +49,7 @@ def read_input_field(expr: Union[str, float, int], V: FunctionSpace = None, mesh
             raise ValueError("Need FunctionSpace or mesh to evaluate symbolic expression.")
         x = ufl.SpatialCoordinate(m)
         ufl_expr = eval(expr, {"ufl": ufl, "x": x, "np": np})
-        return Expression(ufl_expr, V.element.interpolation_points, MPI.COMM_WORLD) if V else ufl_expr
+        return Expression(ufl_expr, interp_points, MPI.COMM_WORLD) if V else ufl_expr
 
     raise TypeError(f"Unsupported expression type: {type(expr)}")
 
