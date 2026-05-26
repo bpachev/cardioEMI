@@ -4,6 +4,10 @@ from utils import *
 import dolfinx  as dfx
 import numpy as np
 import math
+try:
+    from cudolfinx import CUDAFunction
+except ImportError:
+    print("cudolfinx not installed! CUDA support not available")
 
 class Ionic_model(ABC):
 
@@ -11,6 +15,7 @@ class Ionic_model(ABC):
     def __init__(self, params, V=None):
         self.params = params                     
         self.V      = V
+        self._cuda = params.get("cuda", False)
 
     @abstractmethod
     def _eval(self, v):
@@ -51,25 +56,16 @@ def ionic_model_factory(params, intra_intra=False, V=None):
 
     elif isinstance(model_name, dict):
 
-        if intra_intra:
-            model_name = model_name["intra_intra"].lower()
+        model_name = model_name["intra_intra" if intra_intra else "intra_extra"].lower()
 
-            if model_name=="passive" or model_name=="ohmic":  
-                return available_models[model_name](params,V)
-            elif model_name in available_models:        
-                return available_models[model_name](params)
-            else:
-                print("Available models: ", available_models)
-                raise ValueError(f"Unknown model name: {model_name}")
-
+        if model_name=="passive" or model_name=="ohmic":  
+            return available_models[model_name](params,V)
+        elif model_name in available_models:        
+            return available_models[model_name](params)
         else:
-            model_name = model_name["intra_extra"].lower()
+            print("Available models: ", available_models)
+            raise ValueError(f"Unknown model name: {model_name}")
 
-            if model_name in available_models:        
-                return available_models[model_name](params)
-            else:
-                print("Available models: ", available_models)
-                raise ValueError(f"Unknown model name: {model_name}")
     else:
         raise ValueError(f"Unknown ionic model type")
 
@@ -93,14 +89,27 @@ class Passive_model(Ionic_model):
         R_g_expr = read_input_field(self.params["R_g"], V=V)
         self.R_g = dfx.fem.Function(V)
         self.R_g.interpolate(R_g_expr)
-        self.R_g = self.R_g.x.array
-        self.R_g = np.reciprocal(self.R_g)
+        if self._cuda:
+            self.cuda_R_g = CUDAFunction(self.R_g)
+            self.cuda_R_g.petsc_vec.reciprocal()
+        else:
+            self.R_g = self.R_g.x.array
+            self.R_g = np.reciprocal(self.R_g)
         
     def __str__(self):
         return f'Passive'
         
     def _eval(self, v):              
         return self.R_g * v
+
+    def apply_cuda(self, fg, v, tau):
+        """Update fg = v - tau*ionic_model(v).
+
+        Inputs are assumed to be CUDA PETSc vectors
+        """
+
+        fg.pointwiseMult(v, self.cuda_R_g.petsc_vec)
+        fg.aypx(-tau, v)
 
 
 # Hodgkin–Huxley

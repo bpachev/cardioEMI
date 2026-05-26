@@ -126,6 +126,10 @@ v_dict = dict()
 uh_dict  = dict()
 vij_dict = dict()
 fg_dict  = dict()
+if cuda:
+    cuda_uh_dict = dict()
+    cuda_vij_dict = dict()
+    cuda_fg_dict = dict()
 
 # to store membrane potential
 v = dfx.fem.Function(V)
@@ -136,13 +140,18 @@ for i in TAGS:
     u_dict[i]  = ufl.TrialFunction(V)
     v_dict[i]  =  ufl.TestFunction(V)
     uh_dict[i] =  dfx.fem.Function(V)
-    
+    if cuda:
+        cuda_uh_dict[i] = cufem.CUDAFunction(uh_dict[i])
+
     # v_ij con i < j to avoid repetions
     for j in TAGS:
         if i < j:
             # Membrane potential and forcing term function
             vij_dict[(i,j)] = dfx.fem.Function(V)
             fg_dict[(i,j)]  = dfx.fem.Function(V)
+            if cuda:
+                cuda_fg_dict[(i,j)] = cufem.CUDAFunction(fg_dict[(i,j)])
+                cuda_vij_dict[(i,j)] = cufem.CUDAFunction(vij_dict[(i,j)])
 
 # get expression of initial membrane potential
 v_init_expr = read_input_field(params['v_init'], V=V)
@@ -150,17 +159,23 @@ v_init_expr = read_input_field(params['v_init'], V=V)
 # turn expression into a Function with actual DOF values
 v_init = dfx.fem.Function(V)
 v_init.interpolate(v_init_expr)
-        
+if cuda:
+    cu_v_init = cufem.CUDAFunction(v_init)
+
 # init vij using initial membrane potential
 for i in TAGS:
 
     # interpolate v_init in intra_extra, intra_intra is 0 by default
     if i < ECS_TAG:
         vij_dict[(i,ECS_TAG)].interpolate(v_init)
+        if cuda:
+            cuda_vij_dict[(i,ECS_TAG)].petsc_vec.axpy(1, cu_v_init.petsc_vec)
         # v.x.array[:] += vij_dict[(i,ECS_TAG)].x.array[:]
 
     elif i > ECS_TAG:
         vij_dict[(ECS_TAG,i)].interpolate(v_init)
+        if cuda:
+            cuda_vij_dict[(ECS_TAG,i)].petsc_vec.axpy(1, cu_v_init.petsc_vec)
 
 # save membrane potential for visualization (valid only for extra-intra)
 v.x.array[:] = vij_dict[(TAGS[0],TAGS[1])].x.array[:]
@@ -207,7 +222,7 @@ for i in TAGS:
 
         if i < j:
             if i == ECS_TAG or j == ECS_TAG:
-                ionic_models[(i,j)] = ionic_model_factory(params, intra_intra=False)
+                ionic_models[(i,j)] = ionic_model_factory(params, intra_intra=False, V=V)
             else:
                 ionic_models[(i,j)] = ionic_model_factory(params, intra_intra=True, V=V)
 
@@ -475,7 +490,26 @@ for time_step in range(params["time_steps"]):
 
     # Update and assemble vector that is the RHS of the linear system
     t1 = time.perf_counter() # Timestamp for assembly time-lapse      
-    
+   
+    # first evaluate all of the ionic models
+    for i in TAGS:
+        for j in TAGS:
+            if i >= j:
+                continue
+            if cuda:
+                ionic_models[(i,j)].apply_cuda(
+                        cuda_fg_dict[(i,j)].petsc_vec,
+                        cuda_vij_dict[(i,j)].petsc_vec, tau)
+            else:
+                with vij_dict[(i,j)].x.petsc_vec.localForm() as v_local:
+                    t_ODE = time.perf_counter()
+                    I_ion[(i,j)] = ionic_models[(i,j)]._eval(v_local[:])
+                    with fg_dict[(i,j)].x.petsc_vec.localForm() as fg_local:
+                        fg_local[:] = v_local[:] - tau * I_ion[(i,j)]
+                    ODEs_time += time.perf_counter() - t_ODE
+
+
+
     for i in TAGS:
 
         membrane_i = membrane_tags[i]
@@ -493,22 +527,13 @@ for time_step in range(params["time_steps"]):
                 if i < j:
                     ij_tuple = (i,j)                                        
                     L_coeff  = 1
-                    with vij_dict[ij_tuple].x.petsc_vec.localForm() as v_local:
-
-                        t_ODE = time.perf_counter()
-                        
-                        I_ion[ij_tuple] = ionic_models[ij_tuple]._eval(v_local[:])          
-
-                        ODEs_time += time.perf_counter() - t_ODE 
                 else:
                     ij_tuple = (j,i)
                     L_coeff  = -1                    
-                with fg_dict[ij_tuple].x.petsc_vec.localForm() as fg_local, vij_dict[ij_tuple].x.petsc_vec.localForm() as v_local:
-
-                    fg_local[:] = v_local[:] - tau * I_ion[ij_tuple]
-
+                
                 if time_step == 0:
-                    L_i += L_coeff * inner(fg_dict[ij_tuple], v_i('+')) * dS(membrane_ij)
+                    fg = fg_dict[ij_tuple] if not cuda else cuda_fg_dict[ij_tuple]
+                    L_i += L_coeff * inner(fg, v_i('+')) * dS(membrane_ij)
 
                     # external stimulus (time-switched by Constant)
                     if ECS_TAG in (i, j):
@@ -574,6 +599,7 @@ for time_step in range(params["time_steps"]):
         for i, restriction_dofs, size in zip(TAGS, restriction_dof_list, restriction_local_sizes):
             uh_dict[i].x.array[restriction_dofs[:size]] = sol_vec.array[offset:offset+size]
             uh_dict[i].x.scatter_forward()
+            cuda_uh_dict[i].update()
             offset += size
 
     else:
@@ -585,8 +611,11 @@ for time_step in range(params["time_steps"]):
 
     for i in TAGS:
         for j in TAGS:
-            if i < j:                
-                vij_dict[(i,j)].x.array[:] = uh_dict[i].x.array - uh_dict[j].x.array # TODO test other order?
+            if i < j:
+                if not cuda:
+                    vij_dict[(i,j)].x.array[:] = uh_dict[i].x.array - uh_dict[j].x.array # TODO test other order?
+                if cuda:
+                    cuda_vij_dict[(i,j)].petsc_vec.waxpy(-1, cuda_uh_dict[j].petsc_vec, cuda_uh_dict[i].petsc_vec)
                 
     
     solve_time += time.perf_counter() - t1 # Add time lapsed to total solver time
@@ -604,6 +633,8 @@ for time_step in range(params["time_steps"]):
 
         out_v.write_function(v, t)
 
+    for i in uh_dict:
+        print(i, np.max(uh_dict[i].x.array))
 
 if comm.rank == 0: update_status(f'Time stepping: 100%')        
 
@@ -650,7 +681,7 @@ if comm.rank == 0:
     print(f"Setup time:       {max_local_setup_time:.3f} seconds")
     print(f"Assembly time:    {max_local_assemble_time:.3f} seconds")
     print(f"Solve time:       {max_local_solve_time:.3f} seconds")
-    print(f"Ionic model time: {max_local_ODE_time:.3f} seconds")
+    print(f"Ionic model time: {max_local_ODE_time:.5f} seconds")
     print(f"Total time:       {total_time:.3f} seconds")    
     
 
